@@ -119,7 +119,7 @@ This is a **format illustration**, not a claim that the illustrative message exi
 
 ## Run frontend locally
 
-**Prerequisites:** Node.js and npm; access to the Cognito account created for this project; a currently available AWS Learner Lab backend.
+**Prerequisites:** Node.js 22 or newer and npm; access to the Cognito account created for this project; a currently available AWS Learner Lab backend.
 
 From the repository root (this repository contains the frontend project):
 
@@ -151,6 +151,10 @@ https://syedrehanuddin.github.io/CloudChatbotTrigger/
 
 Never commit test passwords, access or refresh tokens, a client secret, webhook tokens, or `.env` files containing credentials.
 
+## Backend source and tests
+
+`backend/` holds the source of both Lambda functions and the mocked tests for `ChatbotTrigger`. Lambdas are deployed by pasting the code into the AWS console; GitHub Actions does not deploy them. See [`backend/README.md`](backend/README.md) for deploying, checking that the deployed code matches the repo, and running the tests.
+
 ## GitHub Pages deployment
 
 The repo includes `.github/workflows/deploy.yml`. GitHub Actions runs on pushes to `main`, installs dependencies, builds the Vite site, and deploys `dist/` to GitHub Pages.
@@ -174,7 +178,7 @@ git push origin main
 | Cognito app client | `15ef6nd851a6mepd49qlojrobr` (public SPA client) |
 | API Gateway | `ChatbotTriggerAPI`, HTTP API ID `s2fqrsa25m` |
 | POST Lambda | `ChatbotTrigger`, Python 3.13, timeout **20 s** |
-| GET Lambda | `ChatbotMessageHistory`, Python 3.13 |
+| GET Lambda | `ChatbotMessageHistory`, Python 3.13, timeout **15 s** |
 | DynamoDB table | `ChatbotMessages`, on-demand, primary key `message_id` (String) |
 | History GSI | `user-sub-timestamp-index`, partition key `user_sub`, sort key `timestamp` |
 | AWS IoT topic | `chatbot-trigger/events` |
@@ -184,7 +188,7 @@ git push origin main
 
 - `GET /messages` is protected by the existing Cognito JWT authorizer and reads **only** the authenticated user's partition. Do not accept a caller-supplied `user_sub` in place of JWT claims.
 - API Gateway allows browser origins `http://localhost:8000` and `https://syedrehanuddin.github.io`, with `authorization` and `content-type` request headers. **CORS is not authentication.**
-- The `POST /send` route is configured for **1 request per second, burst 2**. Rate limiting is a safety measure, not a quota or abuse-proof guarantee.
+- Route throttling is configured per route: `POST /send` allows **1 request per second, burst 2**, and `GET /messages` allows **2 requests per second, burst 5**. Rate limiting is a safety measure, not a quota or abuse-proof guarantee.
 - The Cognito client has no client secret, uses authorization code flow, and the user pool was verified as **admin-create-only**.
 - The Lambda's Discord payload blocks role/everyone mentions, and the updated code isolates downstream failures rather than claiming a delivery success that did not occur.
 - Avoid placing webhook URLs in source files, screenshots, README files, logs, or issues. Rotate any webhook or password that has been exposed.
@@ -201,6 +205,8 @@ The following was observed in **October 2026** with AWS Academy resources active
 - **Request-ID frontend:** an ordinary send completed with HTTP `200`, and the new record appeared in cloud history. A simulated uncertain network failure/retry was **not** established by this successful-path test.
 - **Unauthenticated route access:** request to `GET /messages` returned HTTP `401`.
 - **Pages-origin CORS preflight:** returned HTTP `204` with GET/POST/OPTIONS and the required headers.
+- **Route throttling:** `get-stage` shows `POST /send` at 1 request/s (burst 2) and `GET /messages` at 2 requests/s (burst 5).
+- **Automated backend tests (mocked, not live):** `backend/` has 30 checks for `ChatbotTrigger` using a simulated DynamoDB and fake IoT/Discord. They do not contact AWS and do not prove the live deployment works; the live checks are the ones listed above.
 
 ## Limitations and scope
 
@@ -209,7 +215,7 @@ The following was observed in **October 2026** with AWS Academy resources active
 - **GSI consistency:** newly stored records can appear shortly after the send; use **Refresh** when needed.
 - **Deduplication is bounded:** a retry of an unresolved request reuses its UUID; the backend has a known possibility of a permanently `PENDING` record if downstream delivery succeeds but the final DynamoDB update fails. Exactly-once notification is **not** promised.
 - **Lab availability:** the public static site can remain visible when AWS Academy's backend is unavailable; new sends and history reads then fail until AWS resources are available.
-- **Deployment reproducibility:** this repository contains the React frontend and its GitHub Pages workflow. AWS backend infrastructure and Lambda source are maintained separately and must be documented/exported independently for a full infrastructure rebuild.
+- **Deployment reproducibility:** the two Lambda functions' source is in `backend/`, but API Gateway, Cognito, DynamoDB (including the GSI) and IoT Core were created by hand in the AWS Academy console and are not exported as infrastructure code. A full rebuild needs those resources recreated manually.
 
 ## Demo checklist
 

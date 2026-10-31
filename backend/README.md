@@ -5,7 +5,7 @@ The backend is deployed by hand in the AWS Academy Learner Lab console. GitHub A
 | Lambda | Route | Source |
 |---|---|---|
 | `ChatbotTrigger` | `POST /send` | `chatbot_trigger/lambda_function.py` |
-| `ChatbotMessageHistory` | `GET /messages` | not exported yet (add as `message_history/lambda_function.py`) |
+| `ChatbotMessageHistory` | `GET /messages` | `chatbot_message_history/lambda_function.py` |
 
 Environment variable names used by `ChatbotTrigger`: `IOT_ENDPOINT`, `DISCORD_WEBHOOK_URL`. The values live only in the Lambda configuration.
 
@@ -15,12 +15,16 @@ Environment variable names used by `ChatbotTrigger`: `IOT_ENDPOINT`, `DISCORD_WE
 2. Paste the file into the Lambda in the AWS console and click **Deploy**.
 3. Send one message from the dashboard to confirm.
 
-To check that the deployed code is identical to this file (run in CloudShell from a folder that contains the repo; do not paste the presigned URL anywhere):
+To check that the deployed code is identical to the file in this repo:
 
-```bash
-curl -s -o /tmp/deployed.zip "$(aws lambda get-function --function-name ChatbotTrigger --query 'Code.Location' --output text)"
-unzip -p /tmp/deployed.zip lambda_function.py | diff - backend/chatbot_trigger/lambda_function.py && echo identical
+1. In the AWS console open the Lambda, then **Code → Download → Download function code .zip**, and extract it.
+2. In PowerShell, from the repository root (change the first path to where you extracted it). No output means the files are identical:
+
+```powershell
+Compare-Object (Get-Content "$env:USERPROFILE\Downloads\deployed\lambda_function.py") (Get-Content backend\chatbot_trigger\lambda_function.py)
 ```
+
+Use the matching folder for `ChatbotMessageHistory`. The downloaded zip contains code only, not the environment variables.
 
 ## Tests
 
