@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAuth } from 'react-oidc-context'
 import {
   Activity, ArrowRight, BellRing, CheckCircle2, ChevronRight,
@@ -8,7 +8,9 @@ import {
 } from 'lucide-react'
 import './App.css'
 
-const SEND_ENDPOINT = 'https://s2fqrsa25m.execute-api.us-east-1.amazonaws.com/send'
+const API_BASE = 'https://s2fqrsa25m.execute-api.us-east-1.amazonaws.com'
+const SEND_ENDPOINT = `${API_BASE}/send`
+const HISTORY_ENDPOINT = `${API_BASE}/messages`
 const MQTT_TOPIC = 'chatbot-trigger/events'
 const MAX_MESSAGE = 500
 const DEFAULT_MESSAGE = 'Hello from Cloud Chatbot Trigger!'
@@ -79,20 +81,62 @@ export default function App() {
   const [sending, setSending] = useState(false)
   const [lastResult, setLastResult] = useState(null)
   const [activity, setActivity] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState('')
   const [error, setError] = useState('')
   const [selectedSection, setSelectedSection] = useState('dashboard')
 
-  const userId = auth.user?.profile?.sub
-  const storageKey = userId ? `cloud-trigger-local-history:${userId}` : null
   const displayName = auth.user?.profile?.email || 'Authorized member'
+  const accessToken = auth.user?.access_token
+  const sessionReady = auth.isAuthenticated && !auth.user?.expired && Boolean(accessToken)
+
+  // The list and summary counters below come from AWS DynamoDB, not localStorage.
+  // API Gateway validates the JWT and the history Lambda queries by the user's sub.
+  const loadActivity = useCallback(async (signal) => {
+    if (!sessionReady) return
+    setHistoryLoading(true)
+    setHistoryError('')
+
+    try {
+      const response = await fetch(HISTORY_ENDPOINT, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal,
+      })
+      let data = {}
+      try { data = await response.json() } catch { /* handled below */ }
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          throw new Error('Your session is not authorized to read history. Sign in again.')
+        }
+        if (response.status === 429) {
+          throw new Error('History requests are temporarily limited. Refresh shortly.')
+        }
+        throw new Error(data.message || `History API returned HTTP ${response.status}.`)
+      }
+      if (!Array.isArray(data.messages)) {
+        throw new Error('AWS returned an unexpected message history response.')
+      }
+      if (!signal?.aborted) setActivity(data.messages.slice(0, 8))
+    } catch (err) {
+      if (signal?.aborted || err.name === 'AbortError') return
+      setHistoryError(err instanceof Error ? err.message : 'Unable to reach AWS message history.')
+    } finally {
+      if (!signal?.aborted) setHistoryLoading(false)
+    }
+  }, [accessToken, sessionReady])
 
   useEffect(() => {
-    if (!storageKey) { setActivity([]); return }
-    try {
-      const stored = JSON.parse(localStorage.getItem(storageKey) || '[]')
-      setActivity(Array.isArray(stored) ? stored.slice(0, 8) : [])
-    } catch { setActivity([]) }
-  }, [storageKey])
+    if (!sessionReady) {
+      setActivity([])
+      setHistoryError('')
+      setHistoryLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    void loadActivity(controller.signal)
+    return () => controller.abort()
+  }, [loadActivity, sessionReady])
 
   const metrics = useMemo(() => ({
     total: activity.length,
@@ -130,21 +174,9 @@ export default function App() {
       let result = {}
       try { result = await response.json() } catch { /* show meaningful error below */ }
       setLastResult({ ...result, httpStatus: response.status })
-      if (result.message_id && storageKey) {
-        const row = {
-          message_id: result.message_id,
-          message: trimmed,
-          timestamp: result.timestamp || new Date().toISOString(),
-          iot_status: result.iot_status || 'UNKNOWN',
-          delivery_status: result.delivery_status || 'UNKNOWN',
-          httpStatus: response.status,
-        }
-        setActivity((previous) => {
-          const next = [row, ...previous].slice(0, 8)
-          try { localStorage.setItem(storageKey, JSON.stringify(next)) } catch { /* optional history */ }
-          return next
-        })
-      }
+      // A newly written DynamoDB GSI entry may take a moment to be queryable.
+      // If the row is not shown immediately, the Refresh button fetches it again.
+      if (result.message_id) void loadActivity()
       if (!response.ok) {
         if (response.status === 401 || response.status === 403) setError('API access denied. Sign in again or verify Cognito authorization.')
         else if (response.status === 429) setError('Too many requests. Wait a few seconds before sending again.')
@@ -190,8 +222,8 @@ export default function App() {
 
           <div className="hero-banner"><div className="hero-copy"><div className="hero-kicker"><span className="live-pulse"/> CLOUD WORKFLOW READY</div><h2>One click. Four AWS-connected steps.</h2><p>Secure request → Lambda processing → DynamoDB + IoT Core → Discord notification.</p><button className="hero-cta" onClick={() => scrollTo('compose')}>Trigger a message <ArrowRight size={16}/></button></div><div className="hero-mark"><span className="orb-core"><Radio size={53}/></span><span className="orb-ring ring-1"/><span className="orb-ring ring-2"/></div></div>
 
-          <section className="metric-grid" aria-label="Browser activity summary">
-            <MetricTile icon={MessageCircle} label="Recent requests" value={metrics.total} hint="Tracked on this browser"/>
+          <section className="metric-grid" aria-label="Cloud message history summary">
+            <MetricTile icon={MessageCircle} label="Recent requests" value={metrics.total} hint="Last 8 DynamoDB records"/>
             <MetricTile icon={CheckCircle2} label="Discord delivered" value={metrics.delivered} hint="Confirmed successful sends" tone="metric-green"/>
             <MetricTile icon={Radio} label="MQTT published" value={metrics.published} hint="IoT Core publish results" tone="metric-blue"/>
             <MetricTile icon={LockKeyhole} label="API authorization" value="JWT" hint="Cognito · openid scope"/>
@@ -213,8 +245,22 @@ export default function App() {
             </section>
           </div>
 
-          <section id="activity" className="panel activity-panel"><div className="panel-header"><div><span className="section-overline">03 / HISTORY</span><h2>Recent activity</h2><p>Last eight requests made from this browser after sign-in. This is not a live DynamoDB query.</p></div><span className="panel-icon"><Activity size={19}/></span></div>
-            {activity.length === 0 ? <div className="empty-activity"><TerminalSquare size={31}/><strong>No messages sent yet</strong><span>Use the message trigger to see results here.</span></div> : <div className="activity-table-wrapper"><table className="activity-table"><thead><tr><th>MESSAGE</th><th>TIME</th><th>MQTT</th><th>DISCORD</th></tr></thead><tbody>{activity.map((entry) => <tr key={entry.message_id}><td><strong title={entry.message}>{entry.message}</strong><small>{entry.message_id.slice(0, 12)}…</small></td><td>{new Date(entry.timestamp).toLocaleString(undefined, {dateStyle:'medium',timeStyle:'short'})}</td><td><StatusLabel status={entry.iot_status}/></td><td><StatusLabel status={entry.delivery_status}/></td></tr>)}</tbody></table></div>}
+          <section id="activity" className="panel activity-panel">
+            <div className="panel-header">
+              <div><span className="section-overline">03 / CLOUD HISTORY</span><h2>Recent activity</h2><p>Latest eight messages from your DynamoDB history, protected by your Cognito login.</p></div>
+              <button type="button" className="panel-icon history-refresh" title="Refresh cloud history" aria-label="Refresh cloud history" onClick={() => void loadActivity()} disabled={historyLoading || !sessionReady}>
+                <RefreshCw size={19} className={historyLoading ? 'spin' : ''}/>
+              </button>
+            </div>
+            {historyError && <div className="error-message" role="alert"><CircleAlert size={18}/><span>{historyError} Use Refresh to try again.</span></div>}
+            {historyLoading && activity.length === 0 ?
+              <div className="empty-activity" role="status"><RefreshCw size={28} className="spin"/><strong>Loading AWS history…</strong><span>Reading messages from DynamoDB.</span></div>
+              : activity.length === 0 && !historyError ?
+              <div className="empty-activity"><TerminalSquare size={31}/><strong>No cloud messages yet</strong><span>Send a message above, then refresh if it takes a moment to appear.</span></div>
+              : activity.length > 0 ?
+              <div className="activity-table-wrapper"><table className="activity-table"><thead><tr><th>MESSAGE</th><th>TIME</th><th>MQTT</th><th>DISCORD</th></tr></thead><tbody>{activity.map((entry) => <tr key={entry.message_id}><td><strong title={entry.message}>{entry.message}</strong><small>{entry.message_id.slice(0, 12)}…</small></td><td>{new Date(entry.timestamp).toLocaleString(undefined, {dateStyle:'medium',timeStyle:'short'})}</td><td><StatusLabel status={entry.iot_status}/></td><td><StatusLabel status={entry.delivery_status}/></td></tr>)}</tbody></table></div>
+              : null}
+            {activity.length > 0 && <p className="history-footnote">DynamoDB · Most recent 8 messages for your account · Refresh to check for new records</p>}
           </section>
 
           <section id="architecture" className="architecture-section"><div className="section-overline">04 / ARCHITECTURE</div><h2>Built on real AWS services</h2><p>Software-only design. A browser replaces the physical trigger button; AWS IoT Core provides MQTT messaging without an ESP32.</p><div className="architecture-grid">{[
