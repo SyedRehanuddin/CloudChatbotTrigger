@@ -18,6 +18,11 @@ const MQTT_TOPIC = 'chatbot-trigger/events'
 const MAX_MESSAGE = 500
 const DEFAULT_MESSAGE = 'Hello from Cloud Chatbot Trigger!'
 
+// The backend uses the request_id UUID as its DynamoDB message_id.
+// Retain an unresolved ID in this tab so a retry can't accidentally deliver twice.
+const PENDING_KEY_PREFIX = 'cloudtrigger:pending-send:v1:'
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
 const SHORTCUTS = [
   'Hello from our Cloud Computing project!',
   'AWS Lambda successfully triggered this message.',
@@ -89,10 +94,64 @@ export default function App() {
   const [error, setError] = useState('')
   const [selectedSection, setSelectedSection] = useState('dashboard')
   const [signingOut, setSigningOut] = useState(false)
+  const [pendingRequest, setPendingRequest] = useState(null)
+  const [pendingReady, setPendingReady] = useState(false)
 
   const displayName = auth.user?.profile?.email || 'Authorized member'
   const accessToken = auth.user?.access_token
   const sessionReady = auth.isAuthenticated && !auth.user?.expired && Boolean(accessToken)
+  const storageKey = auth.user?.profile?.sub
+    ? `${PENDING_KEY_PREFIX}${auth.user.profile.sub}`
+    : null
+
+  // Preserve just one unresolved send across refreshes in this browser tab.
+  // No tokens or passwords are stored here; the user ID only namespaces the key.
+  useEffect(() => {
+    setPendingReady(false)
+    if (!sessionReady || !storageKey) {
+      setPendingRequest(null)
+      setPendingReady(true)
+      return
+    }
+    try {
+      const value = sessionStorage.getItem(storageKey)
+      const parsed = value ? JSON.parse(value) : null
+      if (
+        parsed && typeof parsed.message === 'string' &&
+        parsed.message.length > 0 && parsed.message.length <= MAX_MESSAGE &&
+        typeof parsed.request_id === 'string' && UUID_PATTERN.test(parsed.request_id)
+      ) {
+        setPendingRequest(parsed)
+      } else {
+        setPendingRequest(null)
+        if (value) sessionStorage.removeItem(storageKey)
+      }
+    } catch {
+      setPendingRequest(null)
+    }
+    setPendingReady(true)
+  }, [sessionReady, storageKey])
+
+  const savePendingRequest = (request) => {
+    setPendingRequest(request)
+    if (storageKey) {
+      try { sessionStorage.setItem(storageKey, JSON.stringify(request)) } catch { /* tab storage unavailable */ }
+    }
+  }
+
+  const clearPendingRequest = () => {
+    setPendingRequest(null)
+    if (storageKey) {
+      try { sessionStorage.removeItem(storageKey) } catch { /* tab storage unavailable */ }
+    }
+  }
+
+  const startFreshRequest = () => {
+    if (!window.confirm('The earlier request might already have reached Discord. Start a NEW request anyway?')) return
+    clearPendingRequest()
+    setLastResult(null)
+    setError('Previous request ID discarded. The next send will be a new message.')
+  }
 
   // The list and summary counters below come from AWS DynamoDB, not localStorage.
   // API Gateway validates the JWT and the history Lambda queries by the user's sub.
@@ -178,12 +237,22 @@ export default function App() {
   const handleSend = async (event) => {
     event.preventDefault()
     const trimmed = message.trim()
-    if (sending || !trimmed) return
+    if (sending || !trimmed || !pendingReady) return
     if (trimmed.length > MAX_MESSAGE) { setError('Message must be at most 500 characters.'); return }
-    const accessToken = auth.user?.access_token
-    if (!auth.isAuthenticated || auth.user?.expired || !accessToken) {
-      setError('Your session has expired. Please sign in again before sending.'); return
+    if (!sessionReady) {
+      setError('Your session has expired. Please sign in again before sending.')
+      return
     }
+    if (pendingRequest && pendingRequest.message !== trimmed) {
+      setError('An earlier send is unresolved. Restore that message to retry safely, or choose Start new request below.')
+      return
+    }
+
+    // A new user action after a confirmed 200 gets a new UUID; an uncertain
+    // request reuses its original UUID. Lambda deduplicates on this value.
+    const requestId = pendingRequest?.request_id || crypto.randomUUID()
+    const attempt = { request_id: requestId, message: trimmed }
+    savePendingRequest(attempt) // Persist BEFORE the request leaves this tab.
 
     setSending(true)
     setError('')
@@ -194,25 +263,44 @@ export default function App() {
       const response = await fetch(SEND_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({ message: trimmed }),
+        body: JSON.stringify({ message: trimmed, request_id: requestId }),
         signal: abort.signal,
       })
       let result = {}
       try { result = await response.json() } catch { /* show meaningful error below */ }
       setLastResult({ ...result, httpStatus: response.status })
-      // A newly written DynamoDB GSI entry may take a moment to be queryable.
-      // If the row is not shown immediately, the Refresh button fetches it again.
+
+      // The GSI can be eventually consistent. Refresh re-queries DynamoDB.
       if (result.message_id) void loadActivity()
-      if (!response.ok) {
-        if (response.status === 401 || response.status === 403) setError('API access denied. Sign in again or verify Cognito authorization.')
-        else if (response.status === 429) setError('Too many requests. Wait a few seconds before sending again.')
-        else if (response.status === 502 && result.message_id) setError('Message was stored, but one delivery step failed. Check the status below before retrying.')
-        else setError(result.message || `AWS returned HTTP ${response.status}.`)
+
+      if (response.status === 200 && result.message_id === requestId) {
+        clearPendingRequest()
+        return
+      }
+
+      if (response.status === 202) {
+        setError('The previous request is still PENDING. Use Retry / check same request to check its status without sending a duplicate. If it stays pending, the backend may need attention.')
+      } else if (response.status === 502 && result.message_id) {
+        setError('AWS stored the message, but at least one delivery step failed. Retrying the same ID will NOT resend it. Check its statuses, or explicitly start a new request if needed.')
+      } else if (response.status === 409) {
+        setError('That request ID belongs to a different message or user. Use Start new request to deliberately generate a different ID.')
+      } else if (response.status === 400) {
+        clearPendingRequest()
+        setError(result.message || 'The API rejected this message.')
+      } else if (response.status === 401 || response.status === 403) {
+        setError('API access denied. Sign in again; your request ID has been kept for a safe retry.')
+      } else if (response.status === 429) {
+        setError('Too many requests. Retry the same ID after the rate limit clears.')
+      } else if (!response.ok) {
+        setError(result.message || `AWS returned HTTP ${response.status}. Retry with the same request ID.`)
+      } else {
+        // A 2xx response without a matching message ID is not proof of delivery.
+        setError('The API returned an unexpected result. The same request ID is saved for a safe retry.')
       }
     } catch (err) {
       setError(err.name === 'AbortError'
-        ? 'Request timed out. The message may have been processed. Check Discord and DynamoDB before retrying.'
-        : 'Could not reach the AWS API. Check your connection and whether the Learner Lab is running.')
+        ? 'Request timed out. It may have been processed. Retry / check same request to avoid another Discord post.'
+        : 'Could not confirm the AWS result. Retry / check same request when the network or Learner Lab is available.')
     } finally {
       clearTimeout(deadline)
       setSending(false)
@@ -259,14 +347,21 @@ export default function App() {
             <section id="compose" className="panel compose-panel"><div className="panel-header"><div><span className="section-overline">01 / ACTION</span><h2>Message trigger</h2><p>Send one message through the actual AWS backend.</p></div><span className="panel-icon"><Send size={19}/></span></div>
               <form onSubmit={handleSend}><label className="field-label" htmlFor="message">MESSAGE CONTENT</label><textarea id="message" value={message} onChange={(e) => setMessage(e.target.value)} maxLength={MAX_MESSAGE} rows={5} placeholder="Type a message for your Discord channel…" disabled={sending}/><div className="field-subrow"><span>Discord destination: <strong>#cloud-alerts</strong></span><span>{message.length} / {MAX_MESSAGE}</span></div>
               <div className="suggestions"><span className="field-label">QUICK MESSAGES</span><div className="suggestion-wrap">{SHORTCUTS.map((sample, index) => <button type="button" className="suggestion" key={sample} disabled={sending} onClick={() => setMessage(sample)}><Sparkles size={13}/>{index === 0 ? 'Project greeting' : index === 1 ? 'Lambda test' : 'IoT demo'}</button>)}</div></div>
+              {pendingRequest && !sending && <div className="retry-notice" role="status">
+                <div><strong>Unresolved request · {pendingRequest.request_id.slice(0, 8)}…</strong><p>Safe retry uses the same ID. It will not create another Discord message if AWS already stored it.</p></div>
+                <div className="retry-actions">
+                  {message.trim() !== pendingRequest.message && <button type="button" onClick={() => { setMessage(pendingRequest.message); setError('') }}>Restore pending message</button>}
+                  <button type="button" onClick={startFreshRequest}>Start new request</button>
+                </div>
+              </div>}
               {error && <div className="error-message" role="alert"><CircleAlert size={18}/><span>{error}</span></div>}
-              {lastResult && !error && <div className="success-message" role="status"><CheckCircle2 size={18}/>Backend responded successfully. Check the delivery statuses alongside.</div>}
-              <button className="primary-btn send-btn" type="submit" disabled={sending || !message.trim() || auth.user?.expired}>{sending ? <RefreshCw size={18} className="spin"/> : <Send size={18}/>} {sending ? 'Processing request…' : 'Send cloud message'} <ArrowRight size={17}/></button>
+              {lastResult?.httpStatus === 200 && !error && <div className="success-message" role="status"><CheckCircle2 size={18}/>Backend confirmed this request. Check the delivery statuses alongside.</div>}
+              <button className="primary-btn send-btn" type="submit" disabled={sending || !message.trim() || auth.user?.expired || !pendingReady || (pendingRequest && message.trim() !== pendingRequest.message)}>{sending ? <RefreshCw size={18} className="spin"/> : <Send size={18}/>} {sending ? 'Processing request…' : pendingRequest ? 'Retry / check same request' : 'Send cloud message'} <ArrowRight size={17}/></button>
               </form>
             </section>
 
             <section className="panel pipeline-panel"><div className="panel-header"><div><span className="section-overline">02 / OBSERVABILITY</span><h2>Execution pipeline</h2><p>Results from the most recent request.</p></div><span className="panel-icon"><Activity size={19}/></span></div>
-              <div className="pipeline-list"><PipelineItem icon={ShieldCheck} name="Cognito / API Gateway" detail="JWT-authorized POST /send" status={lastResult?.httpStatus === 200 || lastResult?.httpStatus === 502 ? 'AUTHORIZED' : null} fallback="Waiting"/><PipelineItem icon={Code2} name="AWS Lambda" detail="Validate and process request" status={lastResult?.message_id ? 'EXECUTED' : null} fallback="Waiting"/><PipelineItem icon={Database} name="Amazon DynamoDB" detail="Persist message & delivery state" status={lastResult?.status === 'STORED' ? 'STORED' : null} fallback="Waiting"/><PipelineItem icon={Radio} name="AWS IoT Core" detail={MQTT_TOPIC} status={lastResult?.iot_status} fallback="Waiting"/><PipelineItem icon={MessageCircle} name="Discord webhook" detail="#cloud-alerts channel" status={lastResult?.delivery_status} fallback="Waiting"/></div>
+              <div className="pipeline-list"><PipelineItem icon={ShieldCheck} name="Cognito / API Gateway" detail="JWT-authorized POST /send" status={[200, 202, 502].includes(lastResult?.httpStatus) ? 'AUTHORIZED' : null} fallback="Waiting"/><PipelineItem icon={Code2} name="AWS Lambda" detail="Validate and process request" status={lastResult?.message_id ? 'EXECUTED' : null} fallback="Waiting"/><PipelineItem icon={Database} name="Amazon DynamoDB" detail="Persist message & delivery state" status={lastResult?.status === 'STORED' ? 'STORED' : null} fallback="Waiting"/><PipelineItem icon={Radio} name="AWS IoT Core" detail={MQTT_TOPIC} status={lastResult?.iot_status} fallback="Waiting"/><PipelineItem icon={MessageCircle} name="Discord webhook" detail="#cloud-alerts channel" status={lastResult?.delivery_status} fallback="Waiting"/></div>
               <div className="result-details"><span>LAST MESSAGE ID</span><code>{lastResult?.message_id || 'No request executed yet'}</code><span>HTTP RESPONSE</span><strong>{lastResult?.httpStatus || '—'}</strong>{lastResult?.database_synced === false && <small className="note-danger">Warning: DynamoDB status update did not complete.</small>}</div>
             </section>
           </div>

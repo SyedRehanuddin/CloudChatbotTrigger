@@ -14,3 +14,13 @@ a{color:inherit;text-decoration:none}button{border:0}.app-shell{display:flex;min
 .history-refresh:focus-visible{outline:2px solid #92ceff;outline-offset:3px}
 .history-refresh:disabled{opacity:.55;cursor:default}
 .history-footnote{color:#7289a4;font-size:11px;margin:14px 3px 0;line-height:1.5}
+
+/* Safe retry notice for requests whose final status is unknown. */
+.retry-notice{margin-top:15px;padding:12px 13px;border:1px solid #4b6382;background:#182941;border-radius:9px;color:#c5dffa;font-size:12px;line-height:1.5}
+.retry-notice strong{font-size:12px;color:#e1efff}
+.retry-notice p{margin:5px 0 0;color:#a7bdd4}
+.retry-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.retry-actions button{font-size:11px;font-weight:700;padding:7px 10px;border-radius:7px;background:#24435f;color:#d2e7fb;border:1px solid #3f6385;cursor:pointer}
+.retry-actions button:hover{background:#305a80}
+.retry-actions button:last-child{background:transparent;color:#c3cfdf;border-color:#546274}
+.retry-actions button:disabled{opacity:.5;cursor:not-allowed}
