@@ -1,0 +1,103 @@
+diff --git a/backend/chatbot_trigger/lambda_function.py b/backend/chatbot_trigger/lambda_function.py
+index a6ca67d..9e10921 100644
+--- a/backend/chatbot_trigger/lambda_function.py
++++ b/backend/chatbot_trigger/lambda_function.py
+@@ -17,6 +17,8 @@ IOT_TOPIC = "chatbot-trigger/events"
+ PROJECT = "Cloud Chatbot Trigger"
+ MAX_MESSAGE = 500
+ DISCORD_TIMEOUT = 5
++# A first attempt cannot still be running this long after it started (Lambda timeout is 20 s).
++STALE_PENDING_SECONDS = 60
+ 
+ # Short timeouts and one retry, so a slow AWS call cannot push the request
+ # past API Gateway's 30 s limit (boto3 defaults: 60 s timeouts, up to 10 DynamoDB attempts).
+@@ -177,6 +179,14 @@ def body_from_item(item, database_synced, duplicate):
+     }
+ 
+ 
++def is_stale(item):
++    try:
++        created = datetime.fromisoformat(item["timestamp"])
++        return (datetime.now(timezone.utc) - created).total_seconds() > STALE_PENDING_SECONDS
++    except (KeyError, TypeError, ValueError):
++        return False
++
++
+ def replay_existing(message_id, message, user_sub):
+     """Same request_id sent again (retry): report the stored result, send nothing."""
+     try:
+@@ -203,8 +213,18 @@ def replay_existing(message_id, message, user_sub):
+     states = (existing["iot_status"], existing["delivery_status"])
+ 
+     if "PENDING" in states:
+-        # The first attempt may still be running (client timed out early).
+-        return make_response(202, body_from_item(existing, None, True))
++        if not is_stale(existing):
++            # The first attempt may still be running (client timed out early).
++            return make_response(202, body_from_item(existing, None, True))
++
++        # The first attempt is long finished but never recorded its result (for
++        # example the final DynamoDB update failed). Say so instead of answering
++        # 202 forever; nothing is sent again.
++        unknown = dict(existing)
++        for key in ("iot_status", "delivery_status"):
++            if unknown[key] == "PENDING":
++                unknown[key] = "UNKNOWN"
++        return make_response(502, body_from_item(unknown, False, True))
+ 
+     ok = states == ("PUBLISHED", "SENT")
+     return make_response(200 if ok else 502, body_from_item(existing, True, True))
+@@ -303,6 +323,11 @@ def lambda_handler(event, context):
+         database_synced = True
+     except (ClientError, BotoCoreError):
+         logging.exception("DynamoDB status update failed")
++        # The row stays PENDING; keep the real outcome in CloudWatch for reconciliation.
++        logging.error(
++            "FINALIZE_FAILED message_id=%s iot=%s delivery=%s discord_message_id=%s",
++            message_id, iot_status, delivery_status, discord_message_id,
++        )
+ 
+     # 7. Return the real results
+     success = (
+diff --git a/backend/chatbot_trigger/tests/test_lambda.py b/backend/chatbot_trigger/tests/test_lambda.py
+index 6ec3e0c..e1742e8 100644
+--- a/backend/chatbot_trigger/tests/test_lambda.py
++++ b/backend/chatbot_trigger/tests/test_lambda.py
+@@ -359,7 +359,37 @@ def suite_new():
+     check("new config: hung AWS call gives up in under 12s with exactly 2 attempts", took < 12 and len(accepted) == 2, f"{took:.1f}s/{len(accepted)}")
+ 
+ 
++def suite_pending():
++    print("\n--- final DynamoDB update fails after Discord delivered ---")
++    from datetime import datetime, timedelta, timezone
++
++    with Env(NEW_PATH, "pend") as e:
++        def boom(**k):
++            raise ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "UpdateItem")
++        e.mod.table.update_item = boom
++        rid = str(uuid.uuid4())
++        ev = api_event({"message": "hi", "request_id": rid})
++        r1 = e.call(ev)
++        b1 = body_of(r1)
++        fin = [l for l in e.log.lines if "FINALIZE_FAILED" in l]
++        check("final update fails -> 502, real statuses returned, outcome logged for reconciliation",
++              r1["statusCode"] == 502 and b1["iot_status"] == "PUBLISHED" and b1["delivery_status"] == "SENT"
++              and b1["database_synced"] is False and fin and rid in fin[0] and "delivery=SENT" in fin[0], fin)
++        check("that log line does not contain the webhook token", not secret_leaked(e))
++        r2 = e.call(ev)
++        check("retry within 60 s -> 202, nothing resent", r2["statusCode"] == 202 and len(e.discord.calls) == 1)
++        old = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
++        e.ddb.update_item(Key={"message_id": rid}, UpdateExpression="SET #t = :t",
++                          ExpressionAttributeNames={"#t": "timestamp"}, ExpressionAttributeValues={":t": old})
++        r3 = e.call(ev)
++        b3 = body_of(r3)
++        check("retry after 60 s -> 502 UNKNOWN (not 202 forever), database_synced false, nothing resent",
++              r3["statusCode"] == 502 and b3["iot_status"] == "UNKNOWN" and b3["delivery_status"] == "UNKNOWN"
++              and b3["database_synced"] is False and len(e.discord.calls) == 1 and len(e.iot.publishes) == 1, b3)
++
++
+ suite_new()
++suite_pending()
+ failed = [r for r in results if not r[1]]
+ print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
+ for n, _, d in failed:
