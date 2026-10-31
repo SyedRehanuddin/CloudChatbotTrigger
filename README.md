@@ -207,6 +207,7 @@ The following was observed in **October 2026** with AWS Academy resources active
 - **Pages-origin CORS preflight:** returned HTTP `204` with GET/POST/OPTIONS and the required headers.
 - **Route throttling:** `get-stage` shows `POST /send` at 1 request/s (burst 2) and `GET /messages` at 2 requests/s (burst 5).
 - **Automated backend tests (mocked, not live):** `backend/` has 30 checks for `ChatbotTrigger` using a simulated DynamoDB and fake IoT/Discord. They do not contact AWS and do not prove the live deployment works; the live checks are the ones listed above.
+- **Live GitHub Pages verification (31 October 2026):** Successfully signed in through Amazon Cognito, loaded DynamoDB-backed history, sent messages through the protected AWS API, confirmed successful Lambda, DynamoDB, IoT Core and Discord delivery statuses, signed out through Cognito, and signed in again. Matching message IDs were verified between the dashboard and Discord.
 
 ## Limitations and scope
 
