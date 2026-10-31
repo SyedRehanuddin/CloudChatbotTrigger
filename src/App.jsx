@@ -11,6 +11,9 @@ import './App.css'
 const API_BASE = 'https://s2fqrsa25m.execute-api.us-east-1.amazonaws.com'
 const SEND_ENDPOINT = `${API_BASE}/send`
 const HISTORY_ENDPOINT = `${API_BASE}/messages`
+// Cognito public app client information, never a password or secret.
+const COGNITO_LOGOUT_ENDPOINT = 'https://us-east-1nc9mzpomc.auth.us-east-1.amazoncognito.com/logout'
+const COGNITO_CLIENT_ID = '15ef6nd851a6mepd49qlojrobr'
 const MQTT_TOPIC = 'chatbot-trigger/events'
 const MAX_MESSAGE = 500
 const DEFAULT_MESSAGE = 'Hello from Cloud Chatbot Trigger!'
@@ -85,6 +88,7 @@ export default function App() {
   const [historyError, setHistoryError] = useState('')
   const [error, setError] = useState('')
   const [selectedSection, setSelectedSection] = useState('dashboard')
+  const [signingOut, setSigningOut] = useState(false)
 
   const displayName = auth.user?.profile?.email || 'Authorized member'
   const accessToken = auth.user?.access_token
@@ -147,6 +151,28 @@ export default function App() {
   const scrollTo = (id) => {
     setSelectedSection(id)
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  // Clear the OIDC client's local session and terminate the hosted Cognito
+  // browser session. The return URL is already registered in both environments.
+  const handleSignOut = async () => {
+    if (signingOut) return
+    setSigningOut(true)
+
+    const logoutUrl = new URL(COGNITO_LOGOUT_ENDPOINT)
+    logoutUrl.searchParams.set('client_id', COGNITO_CLIENT_ID)
+    logoutUrl.searchParams.set(
+      'logout_uri',
+      `${window.location.origin}${import.meta.env.BASE_URL}`,
+    )
+
+    try {
+      await auth.removeUser()
+      window.location.assign(logoutUrl.toString())
+    } catch {
+      setSigningOut(false)
+      setError('Could not clear the local session. Please try signing out again.')
+    }
   }
 
   const handleSend = async (event) => {
@@ -215,7 +241,7 @@ export default function App() {
       </aside>
 
       <div className="main-frame">
-        <header className="topbar"><div className="topbar-path"><span>Workspace</span><ChevronRight size={15}/><strong>Overview</strong></div><div className="topbar-right"><div className="environment-tag"><span className="live-pulse"/> CONNECTED SESSION</div><span className="avatar">{displayName.slice(0, 1).toUpperCase()}</span><button className="icon-button" title="Sign out of this dashboard" onClick={() => void auth.removeUser()}><LogOut size={17}/></button></div></header>
+        <header className="topbar"><div className="topbar-path"><span>Workspace</span><ChevronRight size={15}/><strong>Overview</strong></div><div className="topbar-right"><div className="environment-tag"><span className="live-pulse"/> CONNECTED SESSION</div><span className="avatar">{displayName.slice(0, 1).toUpperCase()}</span><button className="icon-button" type="button" title="Sign out from CloudTrigger and Cognito" aria-label="Sign out from CloudTrigger and Cognito" disabled={signingOut} onClick={() => void handleSignOut()}><LogOut size={17}/></button></div></header>
 
         <main className="content">
           <section id="dashboard" className="intro-section"><div><div className="eyebrow"><span className="eyebrow-line"/> SERVERLESS MESSAGING PLATFORM</div><h1>Message control <span>center.</span></h1><p>Trigger a cloud workflow, watch each service respond, and verify Discord delivery—all without physical hardware.</p></div><div className="intro-icon"><Zap size={31} strokeWidth={1.7}/></div></section>
