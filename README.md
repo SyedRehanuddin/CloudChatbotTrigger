@@ -15,11 +15,11 @@ This is a **software-only implementation**: the web dashboard provides the trigg
 
 ## Screenshots
 
-**Authenticated message trigger and execution pipeline** (local development verification):
+**Authenticated message trigger and execution pipeline** (live GitHub Pages verification, 1 November 2026):
 
 ![CloudTrigger dashboard showing authorized, executed, stored, published, sent, and HTTP 200](screenshots/dashboard-pipeline.png)
 
-**Live DynamoDB-backed Recent Activity** (local development verification):
+**DynamoDB-backed Recent Activity** (live GitHub Pages verification, 1 November 2026; cropped to show recent results):
 
 ![CloudTrigger showing the latest stored messages with MQTT and Discord statuses](screenshots/dynamodb-history.png)
 
